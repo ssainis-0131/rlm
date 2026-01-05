@@ -202,6 +202,7 @@ if not is_safe:
 | 9 | Docker network access - container can reach internet | `docker_repl.py` | `network_disabled=True` by default, adds `--network=none` | ✅ Fixed |
 | 10 | Temp directory on host filesystem | `local_repl.py` | `use_tmpfs=True` option mounts tmpfs for temp directory (Linux only) | ✅ Fixed |
 
+
 ### 🟡 Medium Priority
 
 | # | Issue | Location | Proposed Fix |
