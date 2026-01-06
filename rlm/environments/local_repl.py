@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import os
 import platform
 import shutil
@@ -9,6 +10,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
@@ -29,6 +31,44 @@ class ExecutionTimeoutError(Exception):
     """Raised when code execution exceeds the timeout limit."""
 
     pass
+
+
+# =============================================================================
+# Security Audit Logger
+# =============================================================================
+
+# Dedicated logger for security-relevant events (code execution, blocked operations)
+_security_logger = logging.getLogger("rlm.security")
+
+
+def configure_security_logging(
+    log_file: str | None = None,
+    level: int = logging.INFO,
+) -> None:
+    """Configure security audit logging.
+
+    Args:
+        log_file: Path to log file. If None, logs to stderr.
+        level: Logging level (default INFO).
+    """
+    _security_logger.setLevel(level)
+
+    # Clear existing handlers
+    _security_logger.handlers.clear()
+
+    # Create formatter with timestamp and level
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if log_file:
+        handler = logging.FileHandler(log_file)
+    else:
+        handler = logging.StreamHandler()
+
+    handler.setFormatter(formatter)
+    _security_logger.addHandler(handler)
 
 
 # =============================================================================
@@ -117,9 +157,7 @@ def _create_safe_getattr(blocked_attributes: frozenset[str]):
 
     def _safe_getattr(obj, name: str, *default):
         if name in blocked_attributes:
-            raise AttributeError(
-                f"Access to attribute '{name}' is blocked for security reasons"
-            )
+            raise AttributeError(f"Access to attribute '{name}' is blocked for security reasons")
         return getattr(obj, name, *default)
 
     return _safe_getattr
@@ -137,9 +175,7 @@ def _create_safe_setattr(blocked_attributes: frozenset[str]):
 
     def _safe_setattr(obj, name: str, value):
         if name in blocked_attributes:
-            raise AttributeError(
-                f"Setting attribute '{name}' is blocked for security reasons"
-            )
+            raise AttributeError(f"Setting attribute '{name}' is blocked for security reasons")
         return setattr(obj, name, value)
 
     return _safe_setattr
@@ -162,7 +198,8 @@ _SAFE_BUILTINS = {
     "set": set,
     "tuple": tuple,
     "bool": bool,
-    "type": type,
+    # NOTE: type() and object removed to prevent metaclass exploits (Security Fix #12)
+    # "type": type,
     "isinstance": isinstance,
     "issubclass": issubclass,
     "enumerate": enumerate,
@@ -205,7 +242,8 @@ _SAFE_BUILTINS = {
     "bytearray": bytearray,
     "memoryview": memoryview,
     "complex": complex,
-    "object": object,
+    # NOTE: object removed to prevent metaclass exploits (Security Fix #12)
+    # "object": object,
     "super": super,
     "property": property,
     "staticmethod": staticmethod,
@@ -259,6 +297,8 @@ class LocalREPL(NonIsolatedEnv):
     DEFAULT_TIMEOUT: int = 30
     DEFAULT_MEMORY_LIMIT_MB: int = 512
     DEFAULT_TMPFS_SIZE_MB: int = 64
+    DEFAULT_OUTPUT_LIMIT_MB: int = 1
+    DEFAULT_CPU_PRIORITY: int = 10  # nice value (0-19, higher = lower priority)
 
     def __init__(
         self,
@@ -269,6 +309,10 @@ class LocalREPL(NonIsolatedEnv):
         memory_limit_mb: int | None = None,
         use_tmpfs: bool = False,
         tmpfs_size_mb: int | None = None,
+        output_limit_mb: int | None = None,
+        cpu_priority: int | None = None,
+        audit_logging: bool = False,
+        audit_log_file: str | None = None,
         **kwargs,
     ):
         """Initialize LocalREPL with security controls.
@@ -286,6 +330,14 @@ class LocalREPL(NonIsolatedEnv):
                 touches disk. Defaults to False for backward compatibility.
             tmpfs_size_mb: Size limit for tmpfs in MB (default 64MB). Only used
                 when use_tmpfs=True.
+            output_limit_mb: Maximum size of stdout/stderr output in MB (default 1MB).
+                Prevents memory exhaustion from excessive output. Set to 0 to disable.
+            cpu_priority: CPU priority using nice value 0-19 (default 10). Higher
+                values = lower priority. Only supported on Unix systems.
+                Set to None or 0 to disable.
+            audit_logging: If True, enable security audit logging of executed code.
+            audit_log_file: Path to audit log file. If None with audit_logging=True,
+                logs to stderr.
         """
         super().__init__(**kwargs)
 
@@ -293,7 +345,9 @@ class LocalREPL(NonIsolatedEnv):
         self.original_cwd = os.getcwd()
         self._lock = threading.Lock()
         self.use_tmpfs = use_tmpfs
-        self.tmpfs_size_mb = tmpfs_size_mb if tmpfs_size_mb is not None else self.DEFAULT_TMPFS_SIZE_MB
+        self.tmpfs_size_mb = (
+            tmpfs_size_mb if tmpfs_size_mb is not None else self.DEFAULT_TMPFS_SIZE_MB
+        )
         self._tmpfs_mounted = False
 
         # Create temp directory (potentially on tmpfs)
@@ -306,6 +360,22 @@ class LocalREPL(NonIsolatedEnv):
         self.memory_limit_mb = (
             memory_limit_mb if memory_limit_mb is not None else self.DEFAULT_MEMORY_LIMIT_MB
         )
+        self.output_limit_mb = (
+            output_limit_mb if output_limit_mb is not None else self.DEFAULT_OUTPUT_LIMIT_MB
+        )
+        self.cpu_priority = cpu_priority if cpu_priority is not None else self.DEFAULT_CPU_PRIORITY
+        self.audit_logging = audit_logging
+        self._session_id = str(uuid.uuid4())[:8]
+        self._execution_count = 0
+
+        # Configure audit logging if enabled
+        if self.audit_logging:
+            configure_security_logging(log_file=audit_log_file)
+            _security_logger.info(
+                f"Session started | session_id={self._session_id} | "
+                f"timeout={self.execution_timeout}s | memory={self.memory_limit_mb}MB | "
+                f"output_limit={self.output_limit_mb}MB | cpu_priority={self.cpu_priority}"
+            )
 
         # Setup globals, locals, and modules in environment.
         self.setup()
@@ -459,7 +529,7 @@ class LocalREPL(NonIsolatedEnv):
 
     @contextmanager
     def _capture_output(self):
-        """Thread-safe context manager to capture stdout/stderr."""
+        """Thread-safe context manager to capture stdout/stderr with size limits."""
         with self._lock:
             old_stdout, old_stderr = sys.stdout, sys.stderr
             stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
@@ -468,6 +538,27 @@ class LocalREPL(NonIsolatedEnv):
                 yield stdout_buf, stderr_buf
             finally:
                 sys.stdout, sys.stderr = old_stdout, old_stderr
+
+    def _truncate_output(self, output: str, stream_name: str = "output") -> str:
+        """Truncate output to configured limit to prevent memory exhaustion.
+
+        Args:
+            output: The output string to potentially truncate.
+            stream_name: Name of the stream for the truncation message.
+
+        Returns:
+            Original output if within limit, otherwise truncated with warning.
+        """
+        if self.output_limit_mb <= 0:
+            return output
+
+        max_bytes = self.output_limit_mb * 1024 * 1024
+        if len(output.encode("utf-8", errors="replace")) > max_bytes:
+            # Truncate to approximate character limit (rough estimate)
+            truncated = output[:max_bytes]
+            warning = f"\n... [{stream_name} truncated: exceeded {self.output_limit_mb}MB limit]"
+            return truncated + warning
+        return output
 
     @contextmanager
     def _temp_cwd(self):
@@ -497,6 +588,23 @@ class LocalREPL(NonIsolatedEnv):
                 # resource module not available or limits not supported
                 pass
 
+    def _apply_cpu_priority(self):
+        """Apply CPU throttling using nice value on Unix systems."""
+        if self.cpu_priority <= 0:
+            return
+
+        current_platform = platform.system()
+        if current_platform in ("Linux", "Darwin"):
+            try:
+                # Use os.nice() to lower process priority
+                # nice values: 0-19, higher = lower priority
+                current_nice = os.nice(0)  # Get current nice value
+                if current_nice < self.cpu_priority:
+                    os.nice(self.cpu_priority - current_nice)
+            except (OSError, PermissionError):
+                # May fail without proper permissions
+                pass
+
     def _execute_with_timeout(
         self, code: str, combined: dict, stdout_buf: io.StringIO, stderr_buf: io.StringIO
     ) -> tuple[str, str, dict, Exception | None]:
@@ -515,8 +623,9 @@ class LocalREPL(NonIsolatedEnv):
 
         def run_code():
             try:
-                # Apply memory limits (only affects this thread's children on some platforms)
+                # Apply resource limits (only affects this thread's children on some platforms)
                 self._apply_memory_limit()
+                self._apply_cpu_priority()
 
                 exec(code, combined, combined)
 
@@ -570,12 +679,32 @@ class LocalREPL(NonIsolatedEnv):
             - File access restricted to temp_dir via _safe_open
             - Execution timeout (configurable, default 30s)
             - Memory limits on Linux/Mac (configurable, default 512MB)
+            - Output size limits (configurable, default 1MB)
+            - CPU throttling via nice value (configurable, default 10)
+            - Security audit logging (optional)
         """
         start_time = time.perf_counter()
+        self._execution_count += 1
+        execution_id = f"{self._session_id}-{self._execution_count}"
+        timestamp = datetime.now().isoformat()
+
+        # Audit log: code submission
+        if self.audit_logging:
+            # Truncate code in logs to prevent log bloat
+            code_preview = code[:500] + "..." if len(code) > 500 else code
+            _security_logger.info(
+                f"Code submitted | exec_id={execution_id} | "
+                f"timestamp={timestamp} | code_length={len(code)} | "
+                f"code_preview={code_preview!r}"
+            )
 
         # Static analysis security check
         safety_result = check_code_safety(code)
         if not safety_result.is_safe:
+            if self.audit_logging:
+                _security_logger.warning(
+                    f"Code blocked | exec_id={execution_id} | reason={safety_result.reason}"
+                )
             return REPLResult(
                 stdout="",
                 stderr=f"Security: {safety_result.reason}",
@@ -600,11 +729,26 @@ class LocalREPL(NonIsolatedEnv):
                 for key, value in new_locals.items():
                     self.locals[key] = value
 
+        # Apply output size limits (Security Fix #11)
+        stdout = self._truncate_output(stdout, "stdout")
+        stderr = self._truncate_output(stderr, "stderr")
+
+        execution_time = time.perf_counter() - start_time
+
+        # Audit log: execution completed
+        if self.audit_logging:
+            status = "error" if stderr else "success"
+            _security_logger.info(
+                f"Execution completed | exec_id={execution_id} | "
+                f"status={status} | duration={execution_time:.3f}s | "
+                f"stdout_len={len(stdout)} | stderr_len={len(stderr)}"
+            )
+
         return REPLResult(
             stdout=stdout,
             stderr=stderr,
             locals=self.locals.copy(),
-            execution_time=time.perf_counter() - start_time,
+            execution_time=execution_time,
             rlm_calls=self._pending_llm_calls.copy(),
         )
 

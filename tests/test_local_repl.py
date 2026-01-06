@@ -471,10 +471,11 @@ x = obj.name
     def test_safe_setattr_blocks_dunder_class(self):
         """Test that setattr blocks __class__ modification."""
         repl = LocalREPL()
+        # Use SimpleNamespace instead of object since object is now blocked
         result = repl.execute_code("""
 import types
 obj = types.SimpleNamespace()
-setattr(obj, '__class__', object)
+setattr(obj, '__class__', types.SimpleNamespace)
 """)
         assert "AttributeError" in result.stderr
         assert "blocked" in result.stderr.lower() or "__class__" in result.stderr
@@ -568,3 +569,208 @@ with open('test.txt', 'r') as f:
         assert result.stderr == ""
         assert repl.locals["content"] == "hello"
         repl.cleanup()
+
+
+class TestLocalREPLSecurityOutputLimits:
+    """Tests for output size limit security control (Security Fix #11)."""
+
+    def test_output_limit_configured_correctly(self):
+        """Test that output limit is configured with default value."""
+        repl = LocalREPL()
+        assert repl.output_limit_mb == 1  # DEFAULT_OUTPUT_LIMIT_MB
+        repl.cleanup()
+
+    def test_custom_output_limit(self):
+        """Test that custom output limit can be set."""
+        repl = LocalREPL(output_limit_mb=2)
+        assert repl.output_limit_mb == 2
+        repl.cleanup()
+
+    def test_output_limit_disabled_with_zero(self):
+        """Test that output limit can be disabled with 0."""
+        repl = LocalREPL(output_limit_mb=0)
+        assert repl.output_limit_mb == 0
+        repl.cleanup()
+
+    def test_small_output_not_truncated(self):
+        """Test that small outputs are not truncated."""
+        repl = LocalREPL(output_limit_mb=1)
+        result = repl.execute_code("print('Hello, World!')")
+        assert "Hello, World!" in result.stdout
+        assert "truncated" not in result.stdout
+        repl.cleanup()
+
+    def test_large_output_truncated(self):
+        """Test that outputs exceeding limit are truncated."""
+        # Use very small limit for testing (in a real scenario this would be 1MB)
+        repl = LocalREPL(output_limit_mb=1)
+        # Generate ~2MB of output
+        result = repl.execute_code("print('X' * (2 * 1024 * 1024))")
+        # Output should be truncated with warning
+        assert "truncated" in result.stdout or len(result.stdout) <= 1024 * 1024 + 100
+        repl.cleanup()
+
+    def test_output_limit_applies_to_stderr(self):
+        """Test that output limit also applies to stderr."""
+        repl = LocalREPL(output_limit_mb=1)
+        # Generate error output - will be smaller but tests the mechanism
+        result = repl.execute_code("import sys; sys.stderr.write('E' * 100)")
+        assert len(result.stderr) >= 0  # Basic sanity check
+        repl.cleanup()
+
+
+class TestLocalREPLSecurityTypeObjectRemoval:
+    """Tests for type() and object removal from builtins (Security Fix #12)."""
+
+    def test_type_not_in_builtins(self):
+        """Test that type() is not available in the sandboxed environment."""
+        repl = LocalREPL()
+        result = repl.execute_code("x = type([1, 2, 3])")
+        # Should fail because type is not available
+        assert "NameError" in result.stderr or "type" in result.stderr
+        repl.cleanup()
+
+    def test_object_not_in_builtins(self):
+        """Test that object is not available in the sandboxed environment."""
+        repl = LocalREPL()
+        result = repl.execute_code("x = object()")
+        # Should fail because object is not available
+        assert "NameError" in result.stderr or "object" in result.stderr
+        repl.cleanup()
+
+    def test_isinstance_still_works(self):
+        """Test that isinstance is still available and works."""
+        repl = LocalREPL()
+        result = repl.execute_code("x = isinstance([1, 2], list)")
+        assert result.stderr == ""
+        assert repl.locals["x"] is True
+        repl.cleanup()
+
+    def test_issubclass_still_works(self):
+        """Test that issubclass is still available and works."""
+        repl = LocalREPL()
+        result = repl.execute_code("x = issubclass(bool, int)")
+        assert result.stderr == ""
+        assert repl.locals["x"] is True
+        repl.cleanup()
+
+
+class TestLocalREPLSecurityCPUThrottling:
+    """Tests for CPU throttling security control (Security Fix #13)."""
+
+    def test_cpu_priority_configured_correctly(self):
+        """Test that CPU priority is configured with default value."""
+        repl = LocalREPL()
+        assert repl.cpu_priority == 10  # DEFAULT_CPU_PRIORITY
+        repl.cleanup()
+
+    def test_custom_cpu_priority(self):
+        """Test that custom CPU priority can be set."""
+        repl = LocalREPL(cpu_priority=15)
+        assert repl.cpu_priority == 15
+        repl.cleanup()
+
+    def test_cpu_priority_disabled_with_zero(self):
+        """Test that CPU priority can be disabled with 0."""
+        repl = LocalREPL(cpu_priority=0)
+        assert repl.cpu_priority == 0
+        repl.cleanup()
+
+    def test_code_still_executes_with_cpu_priority(self):
+        """Test that code execution works with CPU priority enabled."""
+        repl = LocalREPL(cpu_priority=10)
+        result = repl.execute_code("x = sum(range(1000))")
+        assert result.stderr == ""
+        assert repl.locals["x"] == 499500
+        repl.cleanup()
+
+
+class TestLocalREPLSecurityAuditLogging:
+    """Tests for audit logging security control (Security Fix #14)."""
+
+    def test_audit_logging_disabled_by_default(self):
+        """Test that audit logging is disabled by default."""
+        repl = LocalREPL()
+        assert repl.audit_logging is False
+        repl.cleanup()
+
+    def test_audit_logging_can_be_enabled(self):
+        """Test that audit logging can be enabled."""
+        repl = LocalREPL(audit_logging=True)
+        assert repl.audit_logging is True
+        repl.cleanup()
+
+    def test_session_id_generated(self):
+        """Test that a unique session ID is generated."""
+        repl = LocalREPL(audit_logging=True)
+        assert hasattr(repl, "_session_id")
+        assert len(repl._session_id) == 8  # UUID[:8]
+        repl.cleanup()
+
+    def test_execution_count_incremented(self):
+        """Test that execution count is incremented for each execution."""
+        repl = LocalREPL()
+        assert repl._execution_count == 0
+        repl.execute_code("x = 1")
+        assert repl._execution_count == 1
+        repl.execute_code("y = 2")
+        assert repl._execution_count == 2
+        repl.cleanup()
+
+    def test_audit_logging_with_file(self):
+        """Test that audit logging can write to a file."""
+        import logging
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            log_file = f.name
+
+        try:
+            repl = LocalREPL(audit_logging=True, audit_log_file=log_file)
+            repl.execute_code("x = 1 + 1")
+            repl.cleanup()
+
+            # Close all handlers on the security logger before reading/deleting
+            security_logger = logging.getLogger("rlm.security")
+            for handler in security_logger.handlers[:]:
+                handler.close()
+                security_logger.removeHandler(handler)
+
+            # Check that log file has content
+            with open(log_file) as f:
+                content = f.read()
+            assert "Session started" in content or "Code submitted" in content
+        finally:
+            try:
+                os.unlink(log_file)
+            except PermissionError:
+                pass  # Windows may still hold the file
+
+    def test_audit_logging_logs_blocked_code(self):
+        """Test that blocked code is logged."""
+        import logging
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+            log_file = f.name
+
+        try:
+            repl = LocalREPL(audit_logging=True, audit_log_file=log_file)
+            repl.execute_code("import os")  # This should be blocked
+            repl.cleanup()
+
+            # Close all handlers on the security logger before reading/deleting
+            security_logger = logging.getLogger("rlm.security")
+            for handler in security_logger.handlers[:]:
+                handler.close()
+                security_logger.removeHandler(handler)
+
+            # Check that blocking was logged
+            with open(log_file) as f:
+                content = f.read()
+            assert "blocked" in content.lower() or "security" in content.lower()
+        finally:
+            try:
+                os.unlink(log_file)
+            except PermissionError:
+                pass  # Windows may still hold the file

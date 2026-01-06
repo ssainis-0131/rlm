@@ -203,15 +203,15 @@ if not is_safe:
 | 10 | Temp directory on host filesystem | `local_repl.py` | `use_tmpfs=True` option mounts tmpfs for temp directory (Linux only) | ✅ Fixed |
 
 
-### 🟡 Medium Priority
+### 🟡 Medium Priority — ✅ COMPLETED
 
-| # | Issue | Location | Proposed Fix |
-|---|-------|----------|--------------|
-| 11 | No output size limits - stdout/stderr can exhaust memory | `_capture_output()` | Truncate output to configurable max (e.g., 1MB) |
-| 12 | `type()` and `object` exposed - enables metaclass exploits | `local_repl.py` L36-37 | Consider removing or restricting |
-| 13 | No CPU throttling - can monopolize CPU | `execute_code()` | Use `nice`/`cpulimit` or cgroups |
-| 14 | No audit logging - executed code not logged | `execute_code()` | Add comprehensive logging with timestamps |
-| 15 | Docker volume mount writable | `docker_repl.py` L231 | Add `:ro` flag except for specific paths |
+| # | Issue | Location | Fix | Status |
+|---|-------|----------|-----|--------|
+| 11 | No output size limits - stdout/stderr can exhaust memory | `local_repl.py` | `output_limit_mb` param (default 1MB) with `_truncate_output()` | ✅ Fixed |
+| 12 | `type()` and `object` exposed - enables metaclass exploits | `local_repl.py` | Removed from `_SAFE_BUILTINS` | ✅ Fixed |
+| 13 | No CPU throttling - can monopolize CPU | `local_repl.py` | `cpu_priority` param (default 10) using `os.nice()` on Unix | ✅ Fixed |
+| 14 | No audit logging - executed code not logged | `local_repl.py` | `audit_logging` param with `configure_security_logging()` | ✅ Fixed |
+| 15 | Docker volume mount writable | `docker_repl.py` | `extra_volume_mounts` with `:ro` by default | ✅ Fixed |
 
 ### 🟢 Nice to Have
 

@@ -179,6 +179,7 @@ class DockerREPL(NonIsolatedEnv):
         - Read-only filesystem (--read-only) with writable /tmp and /workspace
         - Optional network isolation (--network=none)
         - Static analysis before execution
+        - Extra volume mounts default to read-only (:ro)
     """
 
     def __init__(
@@ -188,6 +189,7 @@ class DockerREPL(NonIsolatedEnv):
         context_payload: dict | list | str | None = None,
         setup_code: str | None = None,
         network_disabled: bool = True,
+        extra_volume_mounts: list[dict[str, str]] | None = None,
         **kwargs,
     ):
         """Initialize DockerREPL with security controls.
@@ -200,6 +202,10 @@ class DockerREPL(NonIsolatedEnv):
             network_disabled: If True (default), disable all network access in container.
                 Note: This also disables llm_query() calls to the host. Set to False
                 if you need LLM access from within the container.
+            extra_volume_mounts: Optional list of additional volume mounts. Each dict should
+                have 'host_path' and 'container_path' keys. Mounts are read-only by default
+                unless 'writable': True is specified. Example:
+                [{'host_path': '/data', 'container_path': '/mnt/data', 'writable': False}]
         """
         super().__init__(**kwargs)
 
@@ -213,6 +219,7 @@ class DockerREPL(NonIsolatedEnv):
         self.pending_calls: list[RLMChatCompletion] = []
         self._calls_lock = threading.Lock()
         self.network_disabled = network_disabled
+        self.extra_volume_mounts = extra_volume_mounts or []
 
         self.setup()
 
@@ -257,12 +264,21 @@ class DockerREPL(NonIsolatedEnv):
             "/tmp:rw,noexec,nosuid,size=256m",
             "--tmpfs",
             "/root/.cache:rw,noexec,nosuid,size=256m",
-            # Mount workspace as writable
+            # Mount workspace as writable (required for state persistence)
             "-v",
             f"{self.temp_dir}:/workspace:rw",
             "--add-host",
             "host.docker.internal:host-gateway",
         ]
+
+        # Add extra volume mounts with read-only by default (Security Fix #15)
+        for mount in self.extra_volume_mounts:
+            host_path = mount.get("host_path", "")
+            container_path = mount.get("container_path", "")
+            if host_path and container_path:
+                # Default to read-only unless explicitly set to writable
+                mode = "rw" if mount.get("writable", False) else "ro"
+                docker_cmd.extend(["-v", f"{host_path}:{container_path}:{mode}"])
 
         # Add network isolation if requested
         if self.network_disabled:
